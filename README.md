@@ -92,6 +92,73 @@ for (Map.Entry<String, byte[]> e : unzipped.entrySet()) {
 }
 ```
 
+### 3. ZIP 解压 + 打包服务（带落表）—— `com.example.utils.compress.archive`
+
+上一节的 `ZipUtils` 是纯内存 / 磁盘工具，不关心存储。
+当业务需要"**上传一个 zip → 落表 → 拿到每个文件分别处理 → 再按原结构打回一个 zip**"时，
+使用这一节的一套服务：
+
+- `ZipExtractService`：解压入口，把 zip 里每个文件上传到 `FileStorage`，同时在
+  `ZipExtractRecordRepository` 落一棵"目录树"。
+- `ZipPackService`：打包入口，按 `taskId` 反查记录 → 拉取存储 → 按原结构（含嵌套 zip、
+  空目录）还原为 zip。
+
+> 按题目约定：解压**只**记录解压出来的节点；调用方自己维护"原文件 → 结果文件"映射，
+> 打包前只需要把相应 record 的 `storageKey` 改成结果文件的 key，`ZipPackService`
+> 就会把结果文件按原目录结构塞回 zip。
+
+#### 落表结构 `zip_extract_record`
+
+一张表同时表达**目录树**和**叶子文件在云存储的位置**：
+
+| 字段          | 含义                                                                 |
+| ------------- | -------------------------------------------------------------------- |
+| `id`          | 主键                                                                 |
+| `task_id`     | 任务 ID，一个 zip 一个 task_id，是打包时的入口                       |
+| `parent_id`   | 父节点 id；根节点为 `null`                                           |
+| `entry_name`  | 当前层名字（单层，不含路径分隔符）                                   |
+| `full_path`   | 相对根 zip 的完整路径；**嵌套 zip 用 `!/` 分隔**（调试可读）         |
+| `entry_type`  | `FILE` / `DIRECTORY` / `NESTED_ZIP`                                  |
+| `depth`       | 层级深度（根层下的节点 = 0）                                         |
+| `sort_order`  | 同 parent 下的原始顺序，保证多次打包顺序稳定                         |
+| `storage_key` | 云存储对象 key；**仅 FILE 有值**，DIRECTORY / NESTED_ZIP 为 `null`   |
+| `size`        | 文件字节数；DIRECTORY / NESTED_ZIP 为 0                              |
+| `created_at`  | 创建时间                                                             |
+
+索引建议：`(task_id)`、`(task_id, parent_id)`、`(task_id, full_path)` 唯一索引。
+
+#### 各类边界场景的处理约定
+
+- **嵌套 zip**：识别后展开为 `NESTED_ZIP` 容器节点 + 其下子树。嵌套 zip **自身不占云存储**，
+  打包时由子树重新组装出一个 zip 再作为外层的一个 entry 写入。
+- **空文件夹**：落一行 `DIRECTORY`，打包时显式写一个 `dir/` 目录条目还原。
+- **不同目录重名**：每行 `full_path` 都不一样，`storage_key` 各自独立，天然无冲突。
+- **zip-slip**：路径里的 `..` / `./` 会在解析阶段归一化，不会逃出根。
+- **zip-bomb**：解压时单文件超出 `maxFileSize`（默认 1GB）会抛 `IOException`。
+
+#### 典型使用
+
+```java
+FileStorage storage = new MockCloudFileStorage();           // 换成真实云存储即可
+ZipExtractRecordRepository repo = new InMemoryZipExtractRecordRepository(); // 换成 DB
+
+ZipExtractService extract = new ZipExtractService(storage, repo);
+ZipPackService   pack    = new ZipPackService(storage, repo);
+
+// 1) 解压：上传每个文件到云存储，并落一棵树
+try (InputStream in = new FileInputStream("input.zip")) {
+    extract.extract("task-001", in);
+}
+
+// 2) 业务侧拿到每个 record 的 storageKey，生成"处理后的结果文件"并上传成新 key，
+//    再把对应 record 的 storageKey 改指到新 key（或者直接 UPDATE 数据库）
+
+// 3) 打包：按原 zip 结构输出
+try (OutputStream out = new FileOutputStream("result.zip")) {
+    pack.pack("task-001", out);
+}
+```
+
 ## 构建与测试
 
 ```bash
