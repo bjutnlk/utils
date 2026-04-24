@@ -5,6 +5,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -57,6 +59,22 @@ public final class ZipArchiver {
     /** 单文件最大字节数（默认 1GB），防 zip-bomb。 */
     private static final long DEFAULT_MAX_FILE_SIZE = 1024L * 1024L * 1024L;
 
+    /**
+     * 解析 zip entry 名字用的默认字符集。
+     *
+     * <p>按 zip 规范，只有当 entry 的 general-purpose bit 11 置位时才强制 UTF-8，
+     * 否则编码未定义。实践中：
+     * <ul>
+     *     <li>Linux / macOS / 7-Zip / 各类编程语言压出来的 zip：基本都是 UTF-8，没问题。</li>
+     *     <li><b>Windows 资源管理器</b> "发送到 → 压缩文件夹" 压出来的中文名：
+     *         在简体中文系统上是 GBK，日文系统上是 Shift_JIS，等等。</li>
+     * </ul>
+     *
+     * <p>用 UTF-8 读 GBK 的字节会抛 {@code ZipException: MALFORMED}，这时应通过
+     * {@link #extract(String, InputStream, Charset, long)} 显式指定 GBK。
+     */
+    private static final Charset DEFAULT_ENTRY_CHARSET = StandardCharsets.UTF_8;
+
     /** 缓冲区大小。 */
     private static final int BUFFER_SIZE = 8 * 1024;
 
@@ -74,6 +92,10 @@ public final class ZipArchiver {
      * FILE 节点的字节内容会填到 {@link ArchiveEntry#getContent()}，调用方自己决定
      * 什么时候上传云存储、什么时候置空这个字段。
      *
+     * <p>默认用 UTF-8 解析 entry 名字。如果上游是 Windows 资源管理器压的包并且里面
+     * 有中文名，请用 {@link #extract(String, InputStream, Charset)} 显式传
+     * {@code Charset.forName("GBK")}，否则 JDK 会抛 {@code ZipException: MALFORMED}。
+     *
      * <p><b>流的关闭</b>：{@code zipInput} 由调用方关闭，本方法不关。
      *
      * @param taskId    任务 ID，会写到每个 entry 上，非空
@@ -82,23 +104,41 @@ public final class ZipArchiver {
      * @throws IOException 读取 zip 失败 / 触发 zip-bomb 防护等
      */
     public static List<ArchiveEntry> extract(String taskId, InputStream zipInput) throws IOException {
-        return extract(taskId, zipInput, DEFAULT_MAX_FILE_SIZE);
+        return extract(taskId, zipInput, DEFAULT_ENTRY_CHARSET, DEFAULT_MAX_FILE_SIZE);
     }
 
     /**
-     * 解压的带限制重载，{@code maxFileSize} 限制单个文件解压后的最大字节数。
+     * 指定 entry 名字的字符集。用于兼容 Windows 资源管理器压缩的 GBK 中文名 zip
+     * （默认 UTF-8 解析时会抛 {@code ZipException: MALFORMED}）。
+     *
+     * @param charset 常见取值：{@link StandardCharsets#UTF_8} /
+     *                {@code Charset.forName("GBK")} / {@code Charset.forName("Shift_JIS")}
      */
-    public static List<ArchiveEntry> extract(String taskId, InputStream zipInput, long maxFileSize) throws IOException {
+    public static List<ArchiveEntry> extract(String taskId, InputStream zipInput, Charset charset) throws IOException {
+        return extract(taskId, zipInput, charset, DEFAULT_MAX_FILE_SIZE);
+    }
+
+    /**
+     * 完整参数版本。
+     *
+     * @param charset     entry 名字字符集，避免中文名报 MALFORMED
+     * @param maxFileSize 单文件解压后最大字节数，防 zip-bomb
+     */
+    public static List<ArchiveEntry> extract(String taskId,
+                                             InputStream zipInput,
+                                             Charset charset,
+                                             long maxFileSize) throws IOException {
         if (taskId == null || taskId.isEmpty()) {
             throw new IllegalArgumentException("taskId is required");
         }
         Objects.requireNonNull(zipInput, "zipInput");
+        Objects.requireNonNull(charset, "charset");
         if (maxFileSize <= 0) {
             throw new IllegalArgumentException("maxFileSize must be > 0");
         }
 
         List<ArchiveEntry> result = new ArrayList<>();
-        ExtractContext ctx = new ExtractContext(taskId, maxFileSize, result);
+        ExtractContext ctx = new ExtractContext(taskId, charset, maxFileSize, result);
         extractStream(zipInput, null, 0, "", ctx);
         return result;
     }
@@ -116,7 +156,7 @@ public final class ZipArchiver {
                                       int depth,
                                       String pathPrefix,
                                       ExtractContext ctx) throws IOException {
-        ZipInputStream zis = new ZipInputStream(in);
+        ZipInputStream zis = new ZipInputStream(in, ctx.charset);
 
         // 本层已经产出过的目录：fullPath -> 对应节点
         // 既防止显式 "dir/" entry 与隐含推导出的目录重复落 list，又便于 O(1) 取父节点深度
@@ -251,21 +291,32 @@ public final class ZipArchiver {
      * 表达。传入列表的顺序不重要，本方法内部会按树形结构自行组织，但 <b>不做排序</b> ——
      * 只保证目录结构完整，不保证同层条目顺序和原 zip 一致。
      *
-     * <p><b>流的关闭</b>：{@code out} 由调用方关闭，本方法只 {@code finish}。
+     * <p>entry 名字默认用 UTF-8 写出。如果下游解压方一定要 GBK（比如最终用户
+     * 在老版本 Windows 上解压中文文件名 zip），用 {@link #pack(List, OutputStream, Charset)}
+     * 显式指定。
      *
-     * @param entries 归档条目列表（可能跨多个嵌套层级）
-     * @param out     目标输出流
+     * <p><b>流的关闭</b>：{@code out} 由调用方关闭，本方法只 {@code finish}。
      */
     public static void pack(List<ArchiveEntry> entries, OutputStream out) throws IOException {
+        pack(entries, out, DEFAULT_ENTRY_CHARSET);
+    }
+
+    /**
+     * 指定 entry 名字字符集的打包重载。
+     *
+     * @param charset 写入 entry 名字用的字符集，常见：UTF-8 / GBK
+     */
+    public static void pack(List<ArchiveEntry> entries, OutputStream out, Charset charset) throws IOException {
         Objects.requireNonNull(entries, "entries");
         Objects.requireNonNull(out, "out");
+        Objects.requireNonNull(charset, "charset");
         if (entries.isEmpty()) {
             throw new IOException("entries is empty, nothing to pack");
         }
 
         Tree tree = Tree.build(entries);
-        ZipOutputStream zos = new ZipOutputStream(out);
-        writeChildren(zos, tree.rootChildren(), "", tree);
+        ZipOutputStream zos = new ZipOutputStream(out, charset);
+        writeChildren(zos, tree.rootChildren(), "", tree, charset);
         zos.finish();
     }
 
@@ -273,24 +324,26 @@ public final class ZipArchiver {
      * 把当前层的节点依次写进 {@code zos}。
      *
      * @param zos        当前层的 ZipOutputStream
-     * @param children   当前层要写入的节点（已经是 null-parent 或 parent == 嵌套 zip）
+     * @param children   当前层要写入的节点
      * @param pathPrefix 当前层相对 {@code zos} 根的路径前缀（末尾含 "/"，根层为 ""）
      * @param tree       整棵树，用于递归取子节点
+     * @param charset    嵌套 zip 打包时沿用的字符集
      */
     private static void writeChildren(ZipOutputStream zos,
                                       List<ArchiveEntry> children,
                                       String pathPrefix,
-                                      Tree tree) throws IOException {
+                                      Tree tree,
+                                      Charset charset) throws IOException {
         for (ArchiveEntry node : children) {
             switch (node.getEntryType()) {
                 case DIRECTORY:
-                    writeDirectory(zos, node, pathPrefix, tree);
+                    writeDirectory(zos, node, pathPrefix, tree, charset);
                     break;
                 case FILE:
                     writeFile(zos, node, pathPrefix);
                     break;
                 case NESTED_ZIP:
-                    writeNestedZip(zos, node, pathPrefix, tree);
+                    writeNestedZip(zos, node, pathPrefix, tree, charset);
                     break;
                 default:
                     throw new IOException("unknown entry type: " + node.getEntryType());
@@ -299,14 +352,14 @@ public final class ZipArchiver {
     }
 
     private static void writeDirectory(ZipOutputStream zos, ArchiveEntry node,
-                                       String pathPrefix, Tree tree) throws IOException {
+                                       String pathPrefix, Tree tree, Charset charset) throws IOException {
         String dirEntryName = pathPrefix + node.getEntryName() + "/";
         zos.putNextEntry(new ZipEntry(dirEntryName));
         zos.closeEntry();
 
         List<ArchiveEntry> kids = tree.childrenOf(node.getFullPath());
         if (!kids.isEmpty()) {
-            writeChildren(zos, kids, dirEntryName, tree);
+            writeChildren(zos, kids, dirEntryName, tree, charset);
         }
     }
 
@@ -323,18 +376,18 @@ public final class ZipArchiver {
     }
 
     private static void writeNestedZip(ZipOutputStream zos, ArchiveEntry node,
-                                       String pathPrefix, Tree tree) throws IOException {
+                                       String pathPrefix, Tree tree, Charset charset) throws IOException {
         List<ArchiveEntry> kids = tree.childrenOf(node.getFullPath());
-        byte[] nestedZipBytes = packSubtree(kids, tree);
+        byte[] nestedZipBytes = packSubtree(kids, tree, charset);
         zos.putNextEntry(new ZipEntry(pathPrefix + node.getEntryName()));
         zos.write(nestedZipBytes);
         zos.closeEntry();
     }
 
-    private static byte[] packSubtree(List<ArchiveEntry> children, Tree tree) throws IOException {
+    private static byte[] packSubtree(List<ArchiveEntry> children, Tree tree, Charset charset) throws IOException {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        ZipOutputStream zos = new ZipOutputStream(baos);
-        writeChildren(zos, children, "", tree);
+        ZipOutputStream zos = new ZipOutputStream(baos, charset);
+        writeChildren(zos, children, "", tree, charset);
         zos.finish();
         zos.close();
         return baos.toByteArray();
@@ -417,11 +470,13 @@ public final class ZipArchiver {
      */
     private static final class ExtractContext {
         final String taskId;
+        final Charset charset;
         final long maxFileSize;
         final List<ArchiveEntry> result;
 
-        ExtractContext(String taskId, long maxFileSize, List<ArchiveEntry> result) {
+        ExtractContext(String taskId, Charset charset, long maxFileSize, List<ArchiveEntry> result) {
             this.taskId = taskId;
+            this.charset = charset;
             this.maxFileSize = maxFileSize;
             this.result = result;
         }
