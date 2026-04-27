@@ -20,8 +20,8 @@ import java.util.List;
  * PptAnalysisService service = new PptAnalysisService();
  *
  * try (InputStream pptIn = ...; OutputStream etOut = ...) {
- *     // 1. 解析得到 JSON
- *     PresentationDocument doc = service.parse(pptIn);
+ *     // 1. 按格式解析得到结构化数据：.pptx 用 PptFormat.PPTX；.dps 用 PptFormat.DPS
+ *     PresentationDocument doc = service.parse(pptIn, PptFormat.PPTX);
  *     String json = service.toJson(doc);
  *     // ↑ 这就是题目要求的"中间 JSON"，可以打印 / 保存 / 走业务逻辑
  *
@@ -57,9 +57,19 @@ public class PptAnalysisService {
         this.etWriter = etWriter;
     }
 
-    /** 把 PPT 流解析成结构化数据。 */
-    public PresentationDocument parse(InputStream pptStream) throws IOException {
-        return parser.parse(pptStream);
+    /** 按指定格式把 PPT 流解析成结构化数据。 */
+    public PresentationDocument parse(InputStream stream, PptFormat format) throws IOException {
+        return parser.parse(stream, format);
+    }
+
+    /** 解析 .pptx（XMLSlideShow / XSLF）。 */
+    public PresentationDocument parsePptx(InputStream pptxStream) throws IOException {
+        return parser.parsePptx(pptxStream);
+    }
+
+    /** 解析 .dps（HSLFSlideShow / HSLF，WPS 演示二进制格式）。 */
+    public PresentationDocument parseDps(InputStream dpsStream) throws IOException {
+        return parser.parseDps(dpsStream);
     }
 
     /** 把结构化数据序列化为 JSON 字符串。 */

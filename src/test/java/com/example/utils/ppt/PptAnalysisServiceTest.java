@@ -4,6 +4,9 @@ import com.example.utils.ppt.model.PresentationDocument;
 import com.example.utils.ppt.model.QaItem;
 import com.example.utils.ppt.model.SlidePage;
 import com.example.utils.ppt.model.SlideTable;
+import org.apache.poi.hslf.usermodel.HSLFSlide;
+import org.apache.poi.hslf.usermodel.HSLFSlideShow;
+import org.apache.poi.hslf.usermodel.HSLFTextBox;
 import org.apache.poi.hssf.usermodel.HSSFWorkbook;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
@@ -38,7 +41,7 @@ class PptAnalysisServiceTest {
         PptAnalysisService service = new PptAnalysisService();
         PresentationDocument doc;
         try (ByteArrayInputStream in = new ByteArrayInputStream(pptxBytes)) {
-            doc = service.parse(in);
+            doc = service.parse(in, PptFormat.PPTX);
         }
 
         assertEquals(3, doc.getTotalPages(), "总页数应为 3");
@@ -99,7 +102,7 @@ class PptAnalysisServiceTest {
 
         PresentationDocument doc;
         try (ByteArrayInputStream in = new ByteArrayInputStream(pptxBytes)) {
-            doc = service.parse(in);
+            doc = service.parsePptx(in);
         }
 
         ByteArrayOutputStream etOut = new ByteArrayOutputStream();
@@ -123,6 +126,31 @@ class PptAnalysisServiceTest {
                 assertEquals("R-第" + i + "页", row.getCell(2).getStringCellValue());
             }
         }
+    }
+
+    @Test
+    void parse_dps_should_use_hslf_and_extract_pages_titles_and_texts() throws Exception {
+        byte[] dpsBytes = buildSampleDps();
+
+        PptAnalysisService service = new PptAnalysisService();
+        PresentationDocument doc;
+        try (ByteArrayInputStream in = new ByteArrayInputStream(dpsBytes)) {
+            doc = service.parseDps(in);
+        }
+
+        assertEquals(2, doc.getTotalPages(), "总页数应为 2");
+
+        SlidePage cover = doc.getPages().get(0);
+        assertEquals("第一章 概述", cover.getTitle());
+        assertTrue(cover.isSectionCover(), "第 1 页只有标题，应被识别为章节封面");
+        assertEquals("第一章 概述", cover.getSectionTitle());
+
+        SlidePage content = doc.getPages().get(1);
+        assertEquals("背景介绍", content.getTitle());
+        String body = String.join("\n", content.getTexts());
+        assertTrue(body.contains("DPS 这是正文一行"));
+        assertEquals("第一章 概述", content.getSectionTitle(),
+                "正文页应继承上一张章节封面的标题");
     }
 
     /** 构造一个三页的 PPTX：封面页 / 正文页 / 表格页。 */
@@ -174,5 +202,36 @@ class PptAnalysisServiceTest {
         for (String line : text.split("\n")) {
             box.addNewTextParagraph().addNewTextRun().setText(line);
         }
+    }
+
+    /**
+     * 构造一个两页的 .dps（HSLF 格式）样例：封面页 + 正文页。
+     *
+     * <p>WPS 的 .dps 文件就是一个 HSLF 二进制 OLE2 文档，POI 把它当 .ppt 处理。
+     */
+    private byte[] buildSampleDps() throws Exception {
+        try (HSLFSlideShow ppt = new HSLFSlideShow();
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+
+            HSLFSlide page1 = ppt.createSlide();
+            addHslfTitle(page1, "第一章 概述");
+
+            HSLFSlide page2 = ppt.createSlide();
+            addHslfTitle(page2, "背景介绍");
+            HSLFTextBox body = page2.createTextBox();
+            body.setAnchor(new Rectangle(50, 120, 600, 200));
+            body.setText("DPS 这是正文一行");
+
+            ppt.write(out);
+            return out.toByteArray();
+        }
+    }
+
+    /** 给一页加一个 HSLF 的标题占位符文本。 */
+    private void addHslfTitle(HSLFSlide slide, String text) {
+        HSLFTextBox titleBox = slide.createTextBox();
+        titleBox.setAnchor(new Rectangle(50, 50, 600, 50));
+        titleBox.setPlaceholder(Placeholder.TITLE);
+        titleBox.setText(text);
     }
 }
