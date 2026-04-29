@@ -17,6 +17,7 @@
         <maven.compiler.target>8</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <slf4j.version>1.7.36</slf4j.version>
+        <spring.version>5.3.39</spring.version>
     </properties>
 
     <dependencies>
@@ -24,6 +25,17 @@
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
             <version>${slf4j.version}</version>
+        </dependency>
+        <!--
+            Spring 5.3 系列兼容 JDK 8，仅引入 spring-context 用于 @Service / @Autowired 等
+            stereotype / DI 注解。本工程只是工具集合，不强制要求宿主工程用 Spring；
+            没用 Spring 的项目可以直接 new ZipArchiver(...) 自己注入依赖。
+        -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-context</artifactId>
+            <version>${spring.version}</version>
+            <scope>provided</scope>
         </dependency>
         <dependency>
             <groupId>org.slf4j</groupId>

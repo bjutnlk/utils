@@ -92,24 +92,28 @@ for (Map.Entry<String, byte[]> e : unzipped.entrySet()) {
 }
 ```
 
-### 3. ZIP 解压 + 打包（可落表 + 可对接云存储）—— `com.example.utils.compress.archive`
+### 3. ZIP 解压 + 打包服务 —— `com.example.utils.compress.archive`
 
-上一节的 `ZipUtils` 是纯粹的 zip 工具。本节在它之上提供一套**结构化**方案：
+上一节的 `ZipUtils` 是纯粹的 zip 工具。本节在它之上提供一个 Spring `@Service`：
 
 > 典型业务：用户上传一个 zip → 系统解压 → 每个文件落表 + 云存储 → 业务侧对每个
 > 文件做处理并生成"结果文件" → 按原 zip 结构把结果文件重新打成一个 zip 返回。
 
-这一层刻意按"职责分离"切成了三块，彼此独立：
+#### 三个角色
 
-- **`ZipArchiver`** —— 纯 zip 工具，**不依赖 DB、不依赖云存储**。
-  - `extract(taskId, in) → List<ArchiveEntry>`：解压为扁平 list，FILE 节点的字节挂在
-    `entry.content` 上，供调用方上传云存储 / 做进一步处理。
-  - `pack(List<ArchiveEntry>, out)`：按 list 里的树形关系打回 zip。
-    要求每个 FILE 节点的 `entry.content` 都已经填好。
-- **`ArchiveStorage`** —— 云存储空接口（`uploadAll` / `downloadAll`）。
-  业务侧自行对接 OSS / S3 / COS 等，本工程 **不提供**实现。
-- **`ArchiveEntryRepository`** —— 落表空接口（`batchInsert` / `findByTaskId`）。
-  业务侧用 MyBatis / JPA / JDBC 实现即可，本工程 **不提供**实现。
+- **`ZipArchiver`**（`@Service`）：核心服务，注入下面两个空接口
+  - `extract(taskId, in) → List<ArchiveEntry>`：纯解压，**不**访问 DB / 云存储；
+    FILE 节点字节挂在 `entry.content`，由业务侧自己负责上传 + 入库。
+  - `pack(taskId) → String storageKey`：**一站式**打包。
+    内部：查解压表 → 调云存储 download → 还原 zip 结构 → 调云存储 upload → 返回新 zip 的 key。
+- **`ArchiveStorage`** —— 云存储空接口，由业务工程实现
+  - `byte[] download(String storageKey)`
+  - `String upload(byte[] data, String originalName, String contentType)`
+- **`ArchiveEntryRepository`** —— 落表空接口，由业务工程实现
+  - `void batchInsert(List<ArchiveEntry>)`
+  - `List<ArchiveEntry> findByTaskId(String taskId)`
+
+> Spring 是 `provided` 依赖，没用 Spring 的工程也可以直接 `new ZipArchiver(storage, repo)`。
 
 #### 表结构 `zip_extract_record`
 
@@ -154,27 +158,54 @@ CREATE TABLE zip_extract_record (
 #### 典型使用
 
 ```java
-// ========== 解压 + 落表 + 上传云存储 ==========
-List<ArchiveEntry> entries;
-try (InputStream in = new FileInputStream("input.zip")) {
-    entries = ZipArchiver.extract("task-001", in);
-}
-archiveStorage.uploadAll(entries);     // FILE 节点：content 上传 → 回填 storageKey → 清空 content
-archiveEntryRepository.batchInsert(entries);  // 整份 list 批量入库
+@RestController
+@RequiredArgsConstructor
+public class ArchiveController {
 
-// ========== 业务侧对每个 FILE 做处理并维护"原文件 → 结果文件"映射 ==========
-// （UPDATE zip_extract_record SET storage_key = <结果文件key> WHERE id = ?）
+    private final ZipArchiver zipArchiver;
+    private final ArchiveStorage storage;
+    private final ArchiveEntryRepository repository;
 
-// ========== 打包 ==========
-List<ArchiveEntry> toPack = archiveEntryRepository.findByTaskId("task-001");
-archiveStorage.downloadAll(toPack);    // 按 storageKey 下载并回填 content
-try (OutputStream out = new FileOutputStream("result.zip")) {
-    ZipArchiver.pack(toPack, out);
+    /** 上传 zip：解压 + 上传云存储 + 落表（解压不访问 DB / 云存储，由调用方串） */
+    @PostMapping("/upload")
+    public void upload(@RequestParam String taskId,
+                       @RequestParam MultipartFile file) throws IOException {
+        try (InputStream in = file.getInputStream()) {
+            List<ArchiveEntry> entries = zipArchiver.extract(taskId, in);
+            for (ArchiveEntry e : entries) {
+                if (e.getEntryType() == EntryType.FILE) {
+                    String key = storage.upload(e.getContent(), e.getEntryName(), null);
+                    e.setStorageKey(key);
+                    e.setContent(null);
+                }
+            }
+            repository.batchInsert(entries);
+        }
+    }
+
+    /** 业务侧另一张映射表把 storage_key 改指到"结果文件"后，调用此接口 */
+    @GetMapping("/pack")
+    public String pack(@RequestParam String taskId) throws IOException {
+        return zipArchiver.pack(taskId);   // 内部一站式：查表→下载→组zip→上传→返回新key
+    }
 }
 ```
 
-三步里 `ZipArchiver` 和 `ArchiveStorage` / `ArchiveEntryRepository` **没有任何直接耦合**，
-串联过程完全由上层业务把控，方便替换存储、替换 ORM、插入自己的前后处理逻辑。
+`pack(taskId)` 内部串联：
+
+```
+findByTaskId(taskId)
+   ↓
+对每个 FILE 节点：storage.download(storageKey) → entry.content
+   ↓
+按 parentPath / fullPath 还原树（含嵌套 zip / 空目录）
+   ↓
+组装出新 zip 字节
+   ↓
+storage.upload(zipBytes, taskId + ".zip", "application/zip")
+   ↓
+返回新 zip 的 storageKey
+```
 
 ## 构建与测试
 
